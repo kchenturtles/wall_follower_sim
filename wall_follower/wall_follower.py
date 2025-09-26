@@ -150,64 +150,103 @@ class WallFollower(Node):
         # self.SIDE: 1 = left wall, -1 = right wall
         s = float(self.SIDE)
 
-        # Simple side-based filtering - let the line angle determine wall validity
-        side_mask = (s * y > 0.0)  # Just filter by side
+        # FRONT OBSTACLE DETECTION: Check for obstacles directly ahead
+        front_obstacle_mask = (
+            (np.abs(y) <= 0.4) &  # Within front corridor (±40cm)
+            (x >= 0.5) & (x <= 2.0)  # 0.5-2.0m ahead for early detection
+        )
         
-        # Apply standard masking
-        primary_mask = base_mask & side_mask & band
-        fallback_mask = base_mask & side_mask
+        front_obstacle_points = np.count_nonzero(front_obstacle_mask)
         
-        # Require minimum points for reliable line fitting
-        min_points_for_fitting = 5
-        wall_mask = primary_mask if np.count_nonzero(primary_mask) >= min_points_for_fitting else fallback_mask
-        
-        # If still insufficient points, require at least 3 points total
-        if np.count_nonzero(wall_mask) < 3:
-            self.publish_constant()
-            return
-
-        wx = x[wall_mask]
-        wy = y[wall_mask]
-        if wx.size < 2:
-            self.publish_constant()
-            return
-
-        # Fit y = m x + b
-        try:
-            A = np.vstack([wx, np.ones_like(wx)]).T
-            m, b = np.linalg.lstsq(A, wy, rcond=None)[0]
-        except Exception:
-            self.publish_constant()
-            return
-
-        # Smart corner detection: only apply boost for REAL corners
-        line_angle = np.arctan(m)  # Angle of the fitted line
-        abs_line_angle_rad = abs(line_angle)
-        abs_line_angle_deg = np.rad2deg(abs_line_angle_rad)
-        
-        # Lateral position of the wall at lookahead
-        y_line = m * self.lookahead_x + b
-        distance = abs(y_line)
-        
-        # Only apply corner logic for steep angles (>35°) AND within reasonable distance
-        is_real_corner = (abs_line_angle_deg > 35.0) and (distance < 4.0)
-        
-        if is_real_corner:
-            # Real corner detected - apply balanced steering boost for sharp turns
-            corner_distance_factor = 0.8  # Moderate distance adjustment
-            steering_boost = 2.2  # Strong but stable boost
-            corner_mode = "CORNER"
+        if front_obstacle_points >= 3:
+            # Front obstacle detected - use it for turning logic
+            fx = x[front_obstacle_mask]
+            fy = y[front_obstacle_mask]
+            
+            # Fit line to front obstacle: y = m*x + b
+            try:
+                front_A = np.vstack([fx, np.ones(fx.size)]).T
+                front_coeffs, _, _, _ = np.linalg.lstsq(front_A, fy, rcond=None)
+                front_m, front_b = front_coeffs
+                
+                # Calculate where obstacle intersects our lookahead point
+                front_y_at_lookahead = front_m * self.lookahead_x + front_b
+                
+                # Determine turn direction - turn away from obstacle
+                if front_y_at_lookahead > 0.1:  # Obstacle on left side
+                    turn_direction = -1.0  # Turn right
+                elif front_y_at_lookahead < -0.1:  # Obstacle on right side  
+                    turn_direction = 1.0   # Turn left
+                else:  # Obstacle straight ahead
+                    turn_direction = s     # Turn toward our wall side
+                
+                # Create large error to force turning
+                error = turn_direction * 2.0  # Strong turn command
+                corner_mode = "FRONT_OBSTACLE"
+                steering_boost = 1.5  # Moderate boost
+                corner_distance_factor = 1.0  # Use normal desired distance for front obstacles
+                distance = abs(front_y_at_lookahead)  # Distance to front obstacle
+                
+                self.get_logger().info(f"FRONT OBSTACLE detected: {front_obstacle_points} pts, pos={front_y_at_lookahead:.2f}m, turn_dir={turn_direction:.1f}")
+                
+                # Skip side wall processing
+                front_obstacle_detected = True
+                
+            except np.linalg.LinAlgError:
+                front_obstacle_detected = False
         else:
-            # Normal wall following - no boost
-            corner_distance_factor = 1.0  # Normal distance
-            steering_boost = 1.0  # No steering boost
-            corner_mode = "NORMAL"
+            front_obstacle_detected = False
+        
+        if not front_obstacle_detected:
+            # Normal side wall following when no front obstacle
+            # Simple side-based filtering - let the line angle determine wall validity
+            side_mask = (s * y > 0.0)  # Just filter by side
+            
+            # Apply standard masking
+            primary_mask = base_mask & side_mask & band
+            fallback_mask = base_mask & side_mask
+            
+            # Require minimum points for reliable line fitting
+            min_points_for_fitting = 5
+            wall_mask = primary_mask if np.count_nonzero(primary_mask) >= min_points_for_fitting else fallback_mask
+            
+            # If still insufficient points, require at least 3 points total
+            if np.count_nonzero(wall_mask) < 3:
+                self.publish_constant()
+                return
 
-        # Error: positive means too far; negative means too close
-        # Adjust desired distance based on wall angle for smoother corners
-        effective_desired_distance = self.DESIRED_DISTANCE * corner_distance_factor
-        error = distance - effective_desired_distance
-        self.get_logger().info(f"wall distance error = {error:.3f} ({corner_mode}: angle={abs_line_angle_deg:.1f}°, dist={distance:.2f}m, boost={steering_boost:.2f})")
+            wx = x[wall_mask]
+            wy = y[wall_mask]
+            if wx.size < 2:
+                self.publish_constant()
+                return
+
+            # Fit y = m x + b
+            try:
+                A = np.vstack([wx, np.ones_like(wx)]).T
+                m, b = np.linalg.lstsq(A, wy, rcond=None)[0]
+            except Exception:
+                self.publish_constant()
+                return
+
+            # Calculate line angle and distance
+            line_angle = np.arctan(m)
+            abs_line_angle_rad = abs(line_angle)
+            abs_line_angle_deg = np.rad2deg(abs_line_angle_rad)
+            
+            # Lateral position of the wall at lookahead
+            y_line = m * self.lookahead_x + b
+            distance = abs(y_line)
+            
+            # Normal wall following error
+            error = distance - self.DESIRED_DISTANCE
+            corner_mode = "NORMAL"
+            steering_boost = 1.0  # No boost for normal wall following
+        # Common logging for both modes
+        if corner_mode == "FRONT_OBSTACLE":
+            self.get_logger().info(f"wall distance error = {error:.3f} ({corner_mode}: boost={steering_boost:.2f})")
+        else:
+            self.get_logger().info(f"wall distance error = {error:.3f} ({corner_mode}: dist={distance:.2f}m, boost={steering_boost:.2f})")
 
         # Time delta
         now = self.get_clock().now()
