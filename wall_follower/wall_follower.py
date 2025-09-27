@@ -25,7 +25,8 @@ class WallFollower(Node):
         self.declare_parameter("drive_topic", "default")
         self.declare_parameter("side", 1)          # 1 left, -1 right
         self.declare_parameter("velocity", 1.0)
-        self.declare_parameter("desired_distance", 1.0)
+        # Explicitly declare as double (float)
+        self.declare_parameter("desired_distance", float(1.0)) 
 
         # DO NOT MODIFY FETCH
         self.SCAN_TOPIC = self.get_parameter('scan_topic').get_parameter_value().string_value
@@ -44,7 +45,7 @@ class WallFollower(Node):
             self.DRIVE_TOPIC = "/drive"
 
         # Sub / Pub
-        self.scan_sub = self.create_subscription(LaserScan, self.SCAN_TOPIC, self.scan_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, self.SCAN_TOPIC, self.scan_callback, 1)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, self.DRIVE_TOPIC, 10)
 
         # Filtering configuration
@@ -62,9 +63,9 @@ class WallFollower(Node):
         self.opposite_wall_rejection = True   # Enable opposite wall filtering
 
         # Control gains - Balanced for stability and corner turning
-        self.kp = 0.5              # Reduced from 0.8 for stability
-        self.kd = 0.3              # Moderate derivative for stability
-        self.ki = 0.05             # Small integral to eliminate steady-state error
+        self.kp = 0.4
+        self.kd = 0.15              
+        self.ki = 0.05
         self.integral_limit = 2.0
         self.max_steer = 1.2       # Balanced for stability and corner turning
         self.lookahead_x = 0.8     # Increased lookahead for more stable line fitting
@@ -150,50 +151,53 @@ class WallFollower(Node):
         # self.SIDE: 1 = left wall, -1 = right wall
         s = float(self.SIDE)
 
-        # FRONT OBSTACLE DETECTION: Check for obstacles directly ahead
+        # Initialize variables to avoid UnboundLocalError
+        error = 0.0
+        corner_mode = "UNKNOWN"
+        steering_boost = 1.0
+        distance = 0.0
+        wx = np.array([])  # Initialize for debug logging
+        m = 0.0           # Initialize for debug logging
+        y_line = 0.0      # Initialize for debug logging
+
+        # FRONT OBSTACLE DETECTION: Check for obstacles directly ahead (very restrictive)
         front_obstacle_mask = (
-            (np.abs(y) <= 0.4) &  # Within front corridor (±40cm)
-            (x >= 0.5) & (x <= 2.0)  # 0.5-2.0m ahead for early detection
+            (np.abs(y) <= 0.25) &  # Narrower corridor (±25cm) to avoid side walls
+            (x >= 0.8) & (x <= 1.5)  # Shorter range for more immediate obstacles only
         )
         
         front_obstacle_points = np.count_nonzero(front_obstacle_mask)
         
-        if front_obstacle_points >= 3:
-            # Front obstacle detected - use it for turning logic
+        # Require many more points to trigger and add additional validation
+        if front_obstacle_points >= 8:
+            # Front obstacle detected - simple logic: turn to keep obstacle on wall side
             fx = x[front_obstacle_mask]
             fy = y[front_obstacle_mask]
             
-            # Fit line to front obstacle: y = m*x + b
-            try:
-                front_A = np.vstack([fx, np.ones(fx.size)]).T
-                front_coeffs, _, _, _ = np.linalg.lstsq(front_A, fy, rcond=None)
-                front_m, front_b = front_coeffs
-                
-                # Calculate where obstacle intersects our lookahead point
-                front_y_at_lookahead = front_m * self.lookahead_x + front_b
-                
-                # Determine turn direction - turn away from obstacle
-                if front_y_at_lookahead > 0.1:  # Obstacle on left side
-                    turn_direction = -1.0  # Turn right
-                elif front_y_at_lookahead < -0.1:  # Obstacle on right side  
-                    turn_direction = 1.0   # Turn left
-                else:  # Obstacle straight ahead
-                    turn_direction = s     # Turn toward our wall side
-                
-                # Create large error to force turning
-                error = turn_direction * 2.0  # Strong turn command
-                corner_mode = "FRONT_OBSTACLE"
-                steering_boost = 1.5  # Moderate boost
-                corner_distance_factor = 1.0  # Use normal desired distance for front obstacles
-                distance = abs(front_y_at_lookahead)  # Distance to front obstacle
-                
-                self.get_logger().info(f"FRONT OBSTACLE detected: {front_obstacle_points} pts, pos={front_y_at_lookahead:.2f}m, turn_dir={turn_direction:.1f}")
-                
-                # Skip side wall processing
-                front_obstacle_detected = True
-                
-            except np.linalg.LinAlgError:
-                front_obstacle_detected = False
+            # Calculate average position of front obstacle
+            avg_obstacle_y = np.mean(fy)
+            
+            # Simple turning logic: turn to keep obstacle on the same side as our wall
+            # Since final steering = self.SIDE * base, we need to set error correctly
+            
+            # if s == 1:  # Following left wall - want obstacle on left side
+            #     if avg_obstacle_y > 0:  # Obstacle already on left (good)
+            #         error = 0.5  # Small correction to maintain
+            #     else:  # Obstacle on right - need to turn left (positive error)
+            #         error = 1.5  # Turn left
+            # else:  # Following right wall (s = -1) - want obstacle on right side
+            #     if avg_obstacle_y < 0:  # Obstacle already on right (good)
+            #         error = 0.5  # Small correction to maintain
+            #     else:  # Obstacle on left - need to turn right (positive error, but SIDE will make it negative)
+            #         error = -1.5  # This becomes negative after SIDE multiplication
+            
+            corner_mode = "FRONT_OBSTACLE"
+            steering_boost = 1.5  # No boost needed for simple logic
+            distance = abs(avg_obstacle_y)
+            
+            self.get_logger().info(f"FRONT OBSTACLE: {front_obstacle_points} pts, avg_y={avg_obstacle_y:.2f}m, wall_side={s}, error={error:.2f}")
+            
+            front_obstacle_detected = True
         else:
             front_obstacle_detected = False
         
@@ -220,23 +224,25 @@ class WallFollower(Node):
             if wx.size < 2:
                 self.publish_constant()
                 return
+            
+            m, b = np.polyfit(wx, wy, 1)
 
             # Fit y = m x + b
-            try:
-                A = np.vstack([wx, np.ones_like(wx)]).T
-                m, b = np.linalg.lstsq(A, wy, rcond=None)[0]
-            except Exception:
-                self.publish_constant()
-                return
+            # try:
+            #     A = np.vstack([wx, np.ones_like(wx)]).T
+            #     m, b = np.polyfit(A, wy, 1)
+            # except Exception:
+            #     self.publish_constant()
+            #     return
 
             # Calculate line angle and distance
-            line_angle = np.arctan(m)
-            abs_line_angle_rad = abs(line_angle)
-            abs_line_angle_deg = np.rad2deg(abs_line_angle_rad)
+            # line_angle = np.arctan(m)
+            # abs_line_angle_rad = abs(line_angle)
+            # abs_line_angle_deg = np.rad2deg(abs_line_angle_rad)
             
             # Lateral position of the wall at lookahead
             y_line = m * self.lookahead_x + b
-            distance = abs(y_line)
+            distance = abs(b) / np.sqrt(m ** 2+1)
             
             # Normal wall following error
             error = distance - self.DESIRED_DISTANCE
@@ -261,10 +267,11 @@ class WallFollower(Node):
 
         # Control output with STEERING BOOST for corners
         base = (self.kp * error) + (self.kd * derivative) + (self.ki * self.integral_error)
-        base = base * steering_boost  # Apply corner steering boost!
+        #base = base * steering_boost  # Apply corner steering boost!
         self.get_logger().info(f"correcting by = {base:.3f} (boosted)")
 
-        steer = float(np.clip(s * base, -self.max_steer, self.max_steer))
+        # steer = float(np.clip(s * base, -self.max_steer, self.max_steer))
+        steer = self.SIDE * base 
         self.get_logger().info(f"s={int(s)}, base={base:.3f}, final_steer={steer:.3f}")
         self.prev_error = error
 
